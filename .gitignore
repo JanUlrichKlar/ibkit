@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.pkl
+*.mat
+*.log
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# Output
+data/processed/
+output_csvs/
+
+# Future dev (optional folders)
+ibkit/analysis/
+ibkit/utils/
+
+# OS junk
+.DS_Store
+Thumbs.db
