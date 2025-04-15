@@ -17,4 +17,21 @@ This project parses Interactive Brokers (IBKR) Activity Statement CSVs, extracts
 
 ## 📂 Project Structure
 
-<pre lang="markdown"><code>``` ibkit/ ├── ibkit/ │ └── importer/ │ └── csv_importer.py # main parser logic ├── data/ │ ├── raw/ # place IBKR CSVs here │ └── processed/ # output: CSVs + .pkl files │ ├── ibkr_2021.pkl │ ├── ibkr_2021/ │ │ ├── Trades_Stocks.csv │ │ └── ... │ └── ibkr_2021_2023.pkl # merged all years ├── notebooks/ # optional: preview notebooks ├── requirements.txt # dependencies ├── README.md └── LICENSE ```</code></pre>
+```bash
+ibkit/
+├── ibkit/
+│   └── importer/
+│       └── csv_importer.py         # main parser logic
+├── data/
+│   ├── raw/                        # place IBKR CSVs here
+│   └── processed/                  # output: CSVs + .pkl files
+│       ├── ibkr_2021.pkl
+│       ├── ibkr_2021/
+│       │   ├── Trades_Stocks.csv
+│       │   └── ...
+│       └── ibkr_2021_2023.pkl      # merged all years
+├── notebooks/                      # optional: demo notebooks
+├── requirements.txt                # dependencies
+├── README.md
+├── LICENSE
+└── .gitignore
