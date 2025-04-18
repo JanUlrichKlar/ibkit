@@ -1,10 +1,10 @@
-# ibkit/importer/csv_importer.py
-
 import csv
 import re
 import pickle
 import pandas as pd
 from pathlib import Path
+import shutil
+from collections import defaultdict
 
 
 class CSVImporter:
@@ -43,51 +43,64 @@ class CSVImporter:
 
         return rows
 
-    def extract_info_sections(self, rows):
-        subtables = {}
-        current_section = None
-        current_headers = None
-        current_rows = []
+    def extract_section(self, rows):
+        header_indices = [(i, row[0].strip()) for i, row in enumerate(rows)
+                          if len(row) > 1 and isinstance(row[1], str) and row[1].strip().lower() == "header"]
 
-        for row in rows:
-            if len(row) > 1 and isinstance(row[1], str) and row[1].strip().lower() == "header":
-                if current_section and current_headers and current_rows:
-                    self._process_section(current_section, current_headers, current_rows, subtables)
-                current_section = row[0].strip()
-                raw_headers = row[1:]
-                current_headers = [h.strip() for h in raw_headers if h.strip() != ""]
-                current_rows = []
-            elif current_section and current_headers:
-                current_rows.append(row[1:1 + len(current_headers)])
+        section_ranges = []
+        section_names = []
 
-        if current_section and current_headers and current_rows:
-            self._process_section(current_section, current_headers, current_rows, subtables)
+        for idx, (start_idx, section) in enumerate(header_indices):
+            end_idx = header_indices[idx + 1][0] if idx + 1 < len(header_indices) else len(rows)
+            section_ranges.append([start_idx, end_idx])
+            section_names.append([section, None])
 
-        return subtables
+        seen = defaultdict(list)
+        for i, (section, _) in enumerate(section_names):
+            seen[section].append(i)
 
-    def _process_section(self, section_name, headers, rows, target_dict):
-        clipped_rows = [row[:len(headers)] for row in rows]
-        df = pd.DataFrame(clipped_rows, columns=headers)
-        df = df.dropna(how='all')
+        for section, dup_indices in seen.items():
+            for idx in dup_indices:
+                start_idx, end_idx = section_ranges[idx]
+                content_rows = rows[start_idx + 1:end_idx]
+                asset_category = None
+                for r in content_rows:
+                    if section == "Transfers" and len(r) > 2:
+                        asset_candidate = r[2]
+                    elif section in ["Trades", "Open Positions", "Financial Instrument Information"] and len(r) > 3:
+                        asset_candidate = r[3]
+                    else:
+                        asset_candidate = None
+                    if asset_candidate and "Total" not in asset_candidate:
+                        asset_category = asset_candidate.strip()
+                        break
+                section_names[idx][1] = asset_category or None
 
-        split_by_asset = {"Trades", "Transfers", "Open Positions"}
+        grouped = defaultdict(dict)
 
-        if section_name in split_by_asset and "Asset Category" in df.columns:
-            for category, group in df.groupby("Asset Category"):
-                key = f"{section_name}.{category.strip()}"
-                key = key.replace(" ", "_")
-                target_dict[key] = group.reset_index(drop=True)
-        else:
-            key = section_name
-            suffix = 1
-            while key in target_dict:
-                key = f"{section_name}_{suffix}"
-                suffix += 1
-            target_dict[key] = df.reset_index(drop=True)
+        for idx, ((start_idx, end_idx), name_pair) in enumerate(zip(section_ranges, section_names)):
+            section, asset_category = name_pair
+            raw_headers = rows[start_idx][1:]
+            headers = [h.strip() for h in raw_headers if h.strip() != ""]
+            content_rows = rows[start_idx + 1:end_idx]
+            table_rows = [r[1:1 + len(headers)] for r in content_rows if len(r) > 1]
+            df = pd.DataFrame(table_rows, columns=headers).dropna(how="all")
+
+            if df.empty:
+                continue
+
+            df = df.reset_index(drop=True)
+            grouped[section][asset_category or "General"] = df
+            print(f"📦 Section processed: {section}_{asset_category or 'General'} → {df.shape}")
+
+        return grouped
 
     def process_all(self, output_dir="data/processed"):
         project_root = Path(__file__).resolve().parents[2]
         output_dir = (project_root / output_dir).resolve()
+
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         files = self.list_csv_files()
@@ -112,7 +125,7 @@ class CSVImporter:
 
             file_path = self.data_dir / fname
             rows = self.load_file(file_path)
-            tables = self.extract_info_sections(rows)
+            tables = self.extract_section(rows)
 
             if not tables:
                 print("⚠️ No tables found.")
@@ -131,30 +144,42 @@ class CSVImporter:
                 return result
 
             def sanitize_filename(name):
-                name = name.replace(" ", "_")
-                return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+                name = name.replace(" ", "_").replace(".", "_")
+                name = re.sub(r"[^a-zA-Z0-9_]+", "_", name)
+                name = name.replace("_Header", "")
+                name = re.sub(r"_+", "_", name)
+                name = name.strip("_")
+                return name
 
-            for name, df in tables.items():
-                safe_name = sanitize_filename(name)
-                df.columns = dedup_columns(df.columns)
-                df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
-                df = df.copy()
-                df = df.replace(r"^\s*$", pd.NA, regex=True)
-                df = df.dropna(axis=1, how="all")
+            for section, category_dict in tables.items():
+                for category, df in category_dict.items():
+                    name = section if category == "General" else f"{section}_{category}"
+                    safe_name = sanitize_filename(name)
+                    df.columns = dedup_columns(df.columns)
 
-                output_file = output_subdir / f"{safe_name}.csv"
-                try:
-                    df.to_csv(output_file, index=False)
-                except OSError as e:
-                    print(f"❌ Failed to save table '{name}': {e}")
+                    if "Qty" in df.columns:
+                        df.rename(columns={"Qty": "Quantity"}, inplace=True)
 
+                    df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
+                    df = df.copy()
+                    df = df.replace(r"^\s*$", pd.NA, regex=True)
+                    df = df.dropna(axis=1, how="all")
+
+                    if not df.empty:
+                        output_file = output_subdir / f"{safe_name}.csv"
+                        try:
+                            df.to_csv(output_file, index=False)
+                            print(f"✅ Saved: {output_file.name} → {df.shape}")
+                        except OSError as e:
+                            print(f"❌ Failed to save table '{category}': {e}")
+
+            # Write nested pickle structure with section[category] layout
             pkl_path = output_dir / f"ibkr_{year}.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(tables, f)
             print(f"💾 Saved all tables to: {pkl_path}")
-            print(f"✅ {len(tables)} tables saved for {year}.")
+            print(f"✅ {sum(len(v) for v in tables.values())} tables saved for {year}.")
 
-        # 🧩 Merge all years into one file
         processed_years = sorted(set(processed_years))
         if processed_years:
             merged = {}
@@ -170,7 +195,6 @@ class CSVImporter:
 
             print(f"\n🧩 Merged all years into: {merged_file}")
 
-
 def main():
     importer = CSVImporter("data/raw")
     importer.process_all()
@@ -178,6 +202,31 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
