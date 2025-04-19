@@ -65,9 +65,9 @@ class CSVImporter:
                 content_rows = rows[start_idx + 1:end_idx]
                 asset_category = None
                 for r in content_rows:
-                    if section == "Transfers" and len(r) > 2:
+                    if section in ["Transfers", "Financial Instrument Information"] and len(r) > 2:
                         asset_candidate = r[2]
-                    elif section in ["Trades", "Open Positions", "Financial Instrument Information"] and len(r) > 3:
+                    elif section in ["Trades", "Open Positions"] and len(r) > 3:
                         asset_candidate = r[3]
                     else:
                         asset_candidate = None
@@ -191,7 +191,7 @@ class CSVImporter:
             end_year = processed_years[-1]
             merged_file = output_dir / f"ibkr_{start_year}_{end_year}.pkl"
             with open(merged_file, "wb") as f:
-                pickle.dump(merged, f)
+                pickle.dump(merged, f,protocol=4)
 
             print(f"\n🧩 Merged all years into: {merged_file}")
 
