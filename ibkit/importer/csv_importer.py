@@ -89,6 +89,15 @@ class CSVImporter:
             if df.empty:
                 continue
 
+            # 🔢 Try converting numeric-looking columns (preserve non-numeric)
+            for col in df.columns:
+                try:
+                    numeric_col = pd.to_numeric(df[col], errors="coerce")
+                    if numeric_col.notna().sum() > 0 and numeric_col.count() >= 0.5 * len(df):
+                        df[col] = numeric_col
+                except Exception:
+                    pass
+
             df = df.reset_index(drop=True)
             grouped[section][asset_category or "General"] = df
             print(f"📦 Section processed: {section}_{asset_category or 'General'} → {df.shape}")
@@ -151,29 +160,35 @@ class CSVImporter:
                 name = name.strip("_")
                 return name
 
-            for section, category_dict in tables.items():
-                for category, df in category_dict.items():
-                    name = section if category == "General" else f"{section}_{category}"
-                    safe_name = sanitize_filename(name)
-                    df.columns = dedup_columns(df.columns)
+            xls_path = output_dir / f"ibkr_{year}.xlsx"
+            with pd.ExcelWriter(xls_path, engine="openpyxl") as writer:
+                for section, category_dict in tables.items():
+                    for category, df in category_dict.items():
+                        name = section if category == "General" else f"{section}_{category}"
+                        safe_name = sanitize_filename(name)
+                        df.columns = dedup_columns(df.columns)
 
-                    if "Qty" in df.columns:
-                        df.rename(columns={"Qty": "Quantity"}, inplace=True)
+                        if "Qty" in df.columns:
+                            df.rename(columns={"Qty": "Quantity"}, inplace=True)
 
-                    df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
-                    df = df.copy()
-                    df = df.replace(r"^\s*$", pd.NA, regex=True)
-                    df = df.dropna(axis=1, how="all")
+                        df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
+                        df = df.copy()
+                        df = df.replace(r"^\s*$", pd.NA, regex=True)
+                        df = df.dropna(axis=1, how="all")
 
-                    if not df.empty:
-                        output_file = output_subdir / f"{safe_name}.csv"
-                        try:
-                            df.to_csv(output_file, index=False)
-                            print(f"✅ Saved: {output_file.name} → {df.shape}")
-                        except OSError as e:
-                            print(f"❌ Failed to save table '{category}': {e}")
+                        if not df.empty:
+                            output_file = output_subdir / f"{safe_name}.csv"
+                            try:
+                                df.to_csv(output_file, index=False)
+                                print(f"✅ Saved: {output_file.name} → {df.shape}")
+                            except OSError as e:
+                                print(f"❌ Failed to save table '{category}': {e}")
 
-            # Write nested pickle structure with section[category] layout
+                            try:
+                                df.to_excel(writer, sheet_name=safe_name[:31], index=False)
+                            except Exception as e:
+                                print(f"❌ Failed to write sheet '{safe_name}': {e}")
+
             pkl_path = output_dir / f"ibkr_{year}.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(tables, f)
@@ -191,7 +206,7 @@ class CSVImporter:
             end_year = processed_years[-1]
             merged_file = output_dir / f"ibkr_{start_year}_{end_year}.pkl"
             with open(merged_file, "wb") as f:
-                pickle.dump(merged, f,protocol=4)
+                pickle.dump(merged, f, protocol=4)
 
             print(f"\n🧩 Merged all years into: {merged_file}")
 
@@ -202,6 +217,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
