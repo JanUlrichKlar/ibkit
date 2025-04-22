@@ -1,6 +1,7 @@
 import csv
 import re
 import pickle
+import json
 import pandas as pd
 from pathlib import Path
 import shutil
@@ -64,6 +65,13 @@ class CSVImporter:
                 start_idx, end_idx = section_ranges[idx]
                 content_rows = rows[start_idx + 1:end_idx]
                 asset_category = None
+                # Special handling for Net Asset Value section
+                if section == "Net Asset Value" and len(rows[start_idx]) > 2:
+                    # Check if "Time Weighted Rate of Return" is in the 3rd position of the header row
+                    if rows[start_idx][2].strip() == "Time Weighted Rate of Return":
+                        section_names[idx][1] = "wRR"
+                        continue
+
                 for r in content_rows:
                     if section in ["Transfers", "Financial Instrument Information"] and len(r) > 2:
                         asset_candidate = r[2]
@@ -89,10 +97,10 @@ class CSVImporter:
             if df.empty:
                 continue
 
-            # 🔢 Try converting numeric-looking columns (preserve non-numeric)
             for col in df.columns:
                 try:
-                    numeric_col = pd.to_numeric(df[col], errors="coerce")
+                    cleaned = df[col].astype(str).str.replace(",", "", regex=False)
+                    numeric_col = pd.to_numeric(cleaned, errors="coerce")
                     if numeric_col.notna().sum() > 0 and numeric_col.count() >= 0.5 * len(df):
                         df[col] = numeric_col
                 except Exception:
@@ -104,7 +112,83 @@ class CSVImporter:
 
         return grouped
 
-    def process_all(self, output_dir="data/processed"):
+    def convert_date_columns(self, df):
+        """Convert all columns containing 'date' (case insensitive) to datetime format."""
+        if df.empty:
+            return df
+        
+        # Find all columns containing 'date' (case insensitive)
+        date_columns = [col for col in df.columns if 'date' in col.lower()]
+        
+        for col in date_columns:
+            try:
+                # Handle empty strings by converting them to pandas NA (Not Available)
+                df[col] = df[col].replace(r'^\s*$', pd.NA, regex=True)
+                # Convert to datetime, using 'coerce' to handle invalid dates by converting them to NaT
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+                print(f"✓ Converted {col} to datetime in table shape {df.shape}")
+            except Exception as e:
+                print(f"⚠️ Failed to convert {col} to datetime: {e}")
+        
+        return df
+
+    def prepare_for_json(self, df_dict):
+        """Convert DataFrame dictionary to JSON-serializable format.
+        
+        Args:
+            df_dict: Dictionary containing DataFrame records
+            
+        Returns:
+            List of dictionaries with values converted to JSON-serializable format
+        """
+        def convert_value(v):
+            # Handle NaN and NaT values by converting to None
+            if pd.isna(v) or isinstance(v, pd._libs.tslibs.nattype.NaTType):
+                return None
+            # Convert pandas Timestamp objects to ISO format strings
+            if isinstance(v, pd.Timestamp):
+                return v.isoformat()
+            return v
+
+        return [{k: convert_value(v) for k, v in record.items()} for record in df_dict]
+
+    def fix_trades_subtotals_account(self, df):
+        """Fix subtotal rows in trades data by shifting Account value one cell right.
+        
+        In subtotal rows, the Account column actually contains Symbol data.
+        This method moves that value to the correct column.
+        
+        Args:
+            df: DataFrame containing trades data
+            
+        Returns:
+            DataFrame with corrected subtotal rows
+        """
+        if not {'Account', 'Header'}.issubset(df.columns) or df.empty:
+            return df
+
+        df = df.copy()
+        # Find rows where Header contains 'SubTotal' (case insensitive)
+        subtotal_mask = df['Header'].str.contains('SubTotal', na=False, case=False)
+
+        # For these rows, if Account has a value, shift it one column right
+        cols = list(df.columns)
+        account_idx = cols.index('Account')
+        if account_idx + 1 < len(cols):
+            next_col = cols[account_idx + 1]
+            # Store Account value and shift it to the next column
+            subtotal_rows = df[subtotal_mask].copy()
+            df.loc[subtotal_mask, next_col] = subtotal_rows['Account']
+            df.loc[subtotal_mask, 'Account'] = pd.NA
+
+        return df
+
+    def process_all(self, output_dir="data/processed", export_format="pkl"):
+        export_format = export_format.lower()
+        allowed_formats = {"pkl", "json", "csv", "excel", "all"}
+        if export_format not in allowed_formats:
+            raise ValueError(f"Invalid export format: {export_format}. Must be one of {allowed_formats}")
+
         project_root = Path(__file__).resolve().parents[2]
         output_dir = (project_root / output_dir).resolve()
 
@@ -161,22 +245,36 @@ class CSVImporter:
                 return name
 
             xls_path = output_dir / f"ibkr_{year}.xlsx"
-            with pd.ExcelWriter(xls_path, engine="openpyxl") as writer:
-                for section, category_dict in tables.items():
-                    for category, df in category_dict.items():
-                        name = section if category == "General" else f"{section}_{category}"
-                        safe_name = sanitize_filename(name)
-                        df.columns = dedup_columns(df.columns)
+            json_path = output_dir / f"ibkr_{year}.json"
+            pkl_path = output_dir / f"ibkr_{year}.pkl"
+            json_dict = {}
 
-                        if "Qty" in df.columns:
-                            df.rename(columns={"Qty": "Quantity"}, inplace=True)
+            writer = pd.ExcelWriter(xls_path, engine="openpyxl") if export_format in {"excel", "all"} else None
 
-                        df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
-                        df = df.copy()
-                        df = df.replace(r"^\s*$", pd.NA, regex=True)
-                        df = df.dropna(axis=1, how="all")
+            for section, category_dict in tables.items():
+                for category, df in category_dict.items():
+                    name = section if category == "General" else f"{section}_{category}"
+                    safe_name = sanitize_filename(name)
+                    df.columns = dedup_columns(df.columns)
 
-                        if not df.empty:
+                    if "Qty" in df.columns:
+                        df.rename(columns={"Qty": "Quantity"}, inplace=True)
+
+                    df = df.loc[:, df.columns.map(lambda col: isinstance(col, str) and col.strip() != "")]
+                    df = df.copy()
+                    df = df.replace(r"^\s*$", pd.NA, regex=True)
+                    df = df.dropna(axis=1, how="all")
+                    
+                    # Convert date columns to datetime
+                    df = self.convert_date_columns(df)
+                    
+                    # Fix trades subtotals and update the df in tables dictionary
+                    if section == "Trades":
+                        df = self.fix_trades_subtotals_account(df)
+                        tables[section][category] = df  # Update the tables dictionary with fixed df
+
+                    if not df.empty:
+                        if export_format in {"csv", "all"}:
                             output_file = output_subdir / f"{safe_name}.csv"
                             try:
                                 df.to_csv(output_file, index=False)
@@ -184,19 +282,31 @@ class CSVImporter:
                             except OSError as e:
                                 print(f"❌ Failed to save table '{category}': {e}")
 
+                        if writer:
                             try:
                                 df.to_excel(writer, sheet_name=safe_name[:31], index=False)
                             except Exception as e:
                                 print(f"❌ Failed to write sheet '{safe_name}': {e}")
 
-            pkl_path = output_dir / f"ibkr_{year}.pkl"
-            with open(pkl_path, "wb") as f:
-                pickle.dump(tables, f)
-            print(f"💾 Saved all tables to: {pkl_path}")
+                        if export_format in {"json", "all"}:
+                            json_dict[safe_name] = self.prepare_for_json(df.to_dict(orient="records"))
+
+            if writer:
+                writer.close()
+
+            if export_format in {"json", "all"}:
+                with open(json_path, "w", encoding="utf-8") as jf:
+                    json.dump(json_dict, jf, indent=2, ensure_ascii=False)
+
+            if export_format in {"pkl", "all"}:
+                with open(pkl_path, "wb") as f:
+                    pickle.dump(tables, f)
+                print(f"💾 Saved all tables to: {pkl_path}")
+
             print(f"✅ {sum(len(v) for v in tables.values())} tables saved for {year}.")
 
         processed_years = sorted(set(processed_years))
-        if processed_years:
+        if processed_years and export_format in {"pkl", "json", "all"}:
             merged = {}
             for year in processed_years:
                 with open(output_dir / f"ibkr_{year}.pkl", "rb") as f:
@@ -205,54 +315,30 @@ class CSVImporter:
             start_year = processed_years[0]
             end_year = processed_years[-1]
             merged_file = output_dir / f"ibkr_{start_year}_{end_year}.pkl"
-            with open(merged_file, "wb") as f:
-                pickle.dump(merged, f, protocol=4)
+            merged_json_path = output_dir / f"ibkr_{start_year}_{end_year}.json"
 
-            print(f"\n🧩 Merged all years into: {merged_file}")
+            if export_format in {"pkl", "all"}:
+                with open(merged_file, "wb") as f:
+                    pickle.dump(merged, f, protocol=4)
+                print(f"\n🧩 Merged all years into: {merged_file}")
+
+            if export_format in {"json", "all"}:
+                merged_dict = {
+                    year: {
+                        f"{section}_{cat}" if cat != "General" else section: self.prepare_for_json(
+                            df.to_dict(orient="records"))
+                        for section, catmap in year_dict.items()
+                        for cat, df in catmap.items()
+                    } for year, year_dict in merged.items()
+                }
+                with open(merged_json_path, "w", encoding="utf-8") as jf:
+                    json.dump(merged_dict, jf, indent=2, ensure_ascii=False)
+                print(f"🧾 Exported merged data to: {merged_json_path}")
 
 def main():
     importer = CSVImporter("data/raw")
-    importer.process_all()
+    importer.process_all(export_format="all")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
